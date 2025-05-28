@@ -27,7 +27,7 @@ LSTM_DROPOUT = 0.2
 FC_LAYERS = [64, 32]  # 空列表表示无额外FC层
 BATCH_SIZE = 64
 LEARNING_RATE = 0.001
-MAX_EPOCHS = 100 # 实际运行时可以调大
+MAX_EPOCHS = 50 # 实际运行时可以调大
 EARLY_STOPPING_PATIENCE = 10
 EARLY_STOPPING_MIN_DELTA = 0.0001
 NORMALIZATION_METHOD = "minmax"  # "minmax" or "standard"
@@ -358,6 +358,58 @@ def make_predictions(model: nn.Module, data_loader: DataLoader, device: torch.de
     return np.concatenate(all_predictions, axis=0)
 
 # 2. 在指定数据集上进行评估
+
+def calculate_cr_accuracy(P_M, P_P): # noqa: N802
+    """
+    计算功率预测准确率 C_R。
+
+    Args:
+        P_M (ndarray): 实际功率值 (y_true_actual)。
+        P_P (ndarray): 预测功率值 (y_pred_actual)。
+
+    Returns:
+        float: 功率预测准确率 C_R (百分比)。
+    """
+    if not isinstance(P_M, np.ndarray):
+        P_M = np.array(P_M)
+    if not isinstance(P_P, np.ndarray):
+        P_P = np.array(P_P)
+
+    if P_M.shape != P_P.shape:
+        raise ValueError(f"实际功率和预测功率的形状必须一致。P_M shape: {P_M.shape}, P_P shape: {P_P.shape}")
+    if P_M.size == 0:
+        return 0.0 # 或者根据需要返回 np.nan 或其他
+
+    N = len(P_M)
+    
+    # 初始化 R_values 数组
+    R_values = np.zeros_like(P_M, dtype=float)
+
+    # 条件 P_M_i > 0.2
+    mask_gt_02 = P_M > 0.2
+    # 对于 P_M[mask_gt_02]，由于 P_M > 0.2，分母不会是0
+    R_values[mask_gt_02] = (P_M[mask_gt_02] - P_P[mask_gt_02]) / P_M[mask_gt_02]
+
+    # 条件 P_M_i <= 0.2
+    mask_le_02 = P_M <= 0.2
+    R_values[mask_le_02] = (P_M[mask_le_02] - P_P[mask_le_02]) / 0.2
+
+    R_i_squared_sum = np.sum(R_values**2)
+
+    if N == 0: # 再次检查，以防 P_M 为空数组
+        return 0.0
+
+    # 计算 C_R
+    # C_R = (1 - sqrt((1/N) * sum(R_i^2))) * 100%
+    term_inside_sqrt = R_i_squared_sum / N
+    # 处理 term_inside_sqrt 可能为负的极端情况（理论上平方和除以N不会为负，但浮点数精度可能导致微小负值）
+    if term_inside_sqrt < 0:
+        term_inside_sqrt = 0 # 或者采取其他错误处理方式
+
+    c_r = (1 - np.sqrt(term_inside_sqrt)) * 100
+
+    return c_r
+
 def evaluate_on_dataset(dataset_type: str, model: nn.Module, raw_data_path: str,
                         scaler: DataScaler, window_size: int, prediction_steps: int,
                         device: torch.device, batch_size: int):
@@ -365,7 +417,7 @@ def evaluate_on_dataset(dataset_type: str, model: nn.Module, raw_data_path: str,
     raw_data = load_and_clean_data(raw_data_path)
     if raw_data.empty:
         print(f"No data for {dataset_type} set. Skipping evaluation.")
-        return np.array([]), np.array([]), np.nan
+        return np.array([]), np.array([]), np.nan, np.nan
 
     scaled_data = scaler.transform(raw_data)
 
@@ -373,7 +425,7 @@ def evaluate_on_dataset(dataset_type: str, model: nn.Module, raw_data_path: str,
 
     if X_eval.nelement() == 0:
         print(f"Not enough data in {dataset_type} set to create sequences. Skipping evaluation.")
-        return np.array([]), np.array([]), np.nan
+        return np.array([]), np.array([]), np.nan, np.nan
 
     eval_dataset = TensorDataset(X_eval, y_true_scaled_tensor)
     eval_loader = DataLoader(eval_dataset, batch_size=batch_size, shuffle=False)
@@ -382,7 +434,7 @@ def evaluate_on_dataset(dataset_type: str, model: nn.Module, raw_data_path: str,
 
     if y_pred_scaled.size == 0:
         print(f"No predictions made for {dataset_type} set. Skipping evaluation.")
-        return np.array([]), np.array([]), np.nan
+        return np.array([]), np.array([]), np.nan, np.nan
 
     y_pred_scaled_step1 = y_pred_scaled[:, 0]
     y_true_scaled_step1 = y_true_scaled_tensor[:, 0].cpu().numpy()
@@ -401,7 +453,11 @@ def evaluate_on_dataset(dataset_type: str, model: nn.Module, raw_data_path: str,
     mse = mean_squared_error(actual_values_step1, predicted_values_step1)
     print(f"{dataset_type} Set - Step 1 Prediction MSE: {mse:.4f}")
 
-    return actual_values_step1, predicted_values_step1, mse
+    # 计算 C_R 准确率
+    cr_accuracy = calculate_cr_accuracy(actual_values_step1, predicted_values_step1)
+    print(f"{dataset_type} Set - Step 1 Prediction C_R: {cr_accuracy:.2f}%")
+
+    return actual_values_step1, predicted_values_step1, mse, cr_accuracy
 
 # VI. 结果可视化模块
 # 1. 损失曲线绘制函数
@@ -428,9 +484,9 @@ def plot_loss_curves(train_loss_history: list, val_loss_history: list, save_path
 
 # 2. 预测对比图绘制函数
 def plot_predictions_comparison(actual_values: np.ndarray, predicted_values: np.ndarray,
-                                dataset_name: str, save_path: str,
-                                mse_value: float, network_params_str: str, learning_rate: float, actual_epochs: int,
-                                max_points: int = 500):
+                                  dataset_name: str, save_path: str,
+                                  mse_value: float, cr_value: float, network_params_str: str, learning_rate: float, actual_epochs: int,
+                                  max_points: int = 500):
     if actual_values.size == 0 or predicted_values.size == 0:
         print(f"No data to plot for {dataset_name} predictions. Skipping plot.")
         return
@@ -477,6 +533,7 @@ def plot_predictions_comparison(actual_values: np.ndarray, predicted_values: np.
     plt.grid(True)
 
     info_text = (f"{dataset_name} MSE: {mse_value:.4f}\n"
+                 f"{dataset_name} C_R: {cr_value:.2f}%\n"
                  f"Network: {network_params_str}\n"
                  f"LR: {learning_rate}, Actual Epochs: {actual_epochs}")
     plt.figtext(0.01, 0.01, info_text, ha="left", va="bottom", fontsize=8, wrap=True,
@@ -567,7 +624,7 @@ if __name__ == "__main__":
     else:
         print(f"Error: Model file not found at {MODEL_SAVE_PATH}. Evaluation will use the last trained model state.")
 
-    actual_train, predicted_train, mse_train = evaluate_on_dataset(
+    actual_train, predicted_train, mse_train, cr_train = evaluate_on_dataset(
         dataset_type="Train",
         model=lstm_model,
         raw_data_path=TRAIN_DATA_PATH,
@@ -580,9 +637,9 @@ if __name__ == "__main__":
     if actual_train.size > 0 and predicted_train.size > 0:
         train_pred_plot_path = os.path.join(FIGURE_SAVE_DIR, f"train_predictions_comparison_{timestamp_str}.png")
         plot_predictions_comparison(actual_train, predicted_train, "Train", train_pred_plot_path,
-                                    mse_train, network_params_str, LEARNING_RATE, actual_epochs_trained)
+                                    mse_train, cr_train, network_params_str, LEARNING_RATE, actual_epochs_trained)
     
-    actual_test, predicted_test, mse_test = evaluate_on_dataset(
+    actual_test, predicted_test, mse_test, cr_test = evaluate_on_dataset(
         dataset_type="Test",
         model=lstm_model,
         raw_data_path=TEST_DATA_PATH,
@@ -595,6 +652,6 @@ if __name__ == "__main__":
     if actual_test.size > 0 and predicted_test.size > 0:
         test_pred_plot_path = os.path.join(FIGURE_SAVE_DIR, f"test_predictions_comparison_{timestamp_str}.png")
         plot_predictions_comparison(actual_test, predicted_test, "Test", test_pred_plot_path,
-                                    mse_test, network_params_str, LEARNING_RATE, actual_epochs_trained)
+                                    mse_test, cr_test, network_params_str, LEARNING_RATE, actual_epochs_trained)
         
     print("\n--- Script Finished ---")
