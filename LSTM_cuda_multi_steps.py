@@ -789,28 +789,9 @@ if __name__ == "__main__":
         optimizer, mode='min', factor=0.5, patience=5
     )
 
-    # 混合精度训练支持 (如果GPU支持) - 对于RTX 3050Ti可能不需要
-    scaler = None
-    gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3 if torch.cuda.is_available() else 0
-
-    # 只在显存充足时启用混合精度训练
-    if torch.cuda.is_available() and gpu_memory_gb > 6.0 and torch.cuda.get_device_capability()[0] >= 7:
-        try:
-            from torch.cuda.amp import GradScaler
-            scaler = GradScaler()
-            print("Mixed precision training enabled (AMP)")
-        except ImportError:
-            print("Mixed precision training not available")
-    else:
-        print("Mixed precision training disabled for 4GB GPU to save memory")
-
-    # 编译模型以提高性能 (PyTorch 2.0+)
-    try:
-        if hasattr(torch, 'compile'):
-            lstm_model = torch.compile(lstm_model)
-            print("Model compiled for better performance")
-    except Exception as e:
-        print(f"Model compilation not available: {e}")
+    # 为了兼容性，禁用高级功能
+    print("Advanced features (AMP, Model Compilation) disabled for maximum compatibility")
+    print("This ensures stable training on RTX 3050Ti with PyTorch 2.7.0")
 
     # 显存使用检查
     if torch.cuda.is_available():
