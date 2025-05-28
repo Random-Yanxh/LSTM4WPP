@@ -835,6 +835,9 @@ if __name__ == "__main__":
                 print("Continuing with current settings, but may encounter errors...")
 
     print("\n--- Starting Model Training ---")
+    train_loss_hist = []
+    val_loss_hist = []
+
     try:
         train_loss_hist, val_loss_hist = train_model(
             model=lstm_model,
@@ -856,38 +859,49 @@ if __name__ == "__main__":
             print(f"   BATCH_SIZE: {BATCH_SIZE} → {BATCH_SIZE//2}")
             print(f"   LSTM_HIDDEN_SIZE: {LSTM_HIDDEN_SIZE} → {LSTM_HIDDEN_SIZE//2}")
             print("   Or use the CPU version: LSTM_cpu_multi_steps.py")
-            raise e
+            exit(1)  # 退出程序而不是抛出异常
+        else:
+            raise e  # 其他错误继续抛出
 
-    actual_epochs_trained = len(train_loss_hist)
+    actual_epochs_trained = len(train_loss_hist) if train_loss_hist else 0
     network_params_str = (f"LSTM(H:{LSTM_HIDDEN_SIZE}, L:{LSTM_NUM_LAYERS}, D:{LSTM_DROPOUT if LSTM_NUM_LAYERS > 1 else 0}), "
                           f"FC:{FC_LAYERS if FC_LAYERS else 'None'}")
 
-    print("\n--- Visualizing Training ---")
-    loss_curve_save_path = os.path.join(FIGURE_SAVE_DIR, f"loss_curve_{timestamp_str}.png")
-    plot_loss_curves(train_loss_hist, val_loss_hist, loss_curve_save_path,
-                       network_params_str, LEARNING_RATE, actual_epochs_trained)
-
-    print("\n--- Loading Best Model for Evaluation ---")
-    if os.path.exists(MODEL_SAVE_PATH): # Uses CUDA specific model path
-        if torch.cuda.is_available():
-            lstm_model.load_state_dict(torch.load(MODEL_SAVE_PATH))
-        else:
-            lstm_model.load_state_dict(torch.load(MODEL_SAVE_PATH, map_location='cpu'))
-        print(f"Model loaded from {MODEL_SAVE_PATH}")
+    # 只有在训练成功时才进行可视化和评估
+    if actual_epochs_trained > 0:
+        print("\n--- Visualizing Training ---")
+        loss_curve_save_path = os.path.join(FIGURE_SAVE_DIR, f"loss_curve_{timestamp_str}.png")
+        plot_loss_curves(train_loss_hist, val_loss_hist, loss_curve_save_path,
+                           network_params_str, LEARNING_RATE, actual_epochs_trained)
     else:
-        print(f"Error: Model file not found at {MODEL_SAVE_PATH}. Evaluation will use the last trained model state.")
+        print("\n--- Training failed, skipping visualization ---")
 
-    # Evaluate on Train set
-    actual_train_all, predicted_train_all, mse_train_per_step, cr_train_per_step = evaluate_on_dataset(
-        dataset_type="Train",
-        model=lstm_model,
-        raw_data_path=TRAIN_DATA_PATH,
-        scaler=data_scaler,
-        window_size=WINDOW_SIZE,
-        prediction_steps=PREDICTION_STEPS,
-        device=DEVICE,
-        batch_size=BATCH_SIZE
-    )
+    if actual_epochs_trained > 0:
+        print("\n--- Loading Best Model for Evaluation ---")
+        if os.path.exists(MODEL_SAVE_PATH): # Uses CUDA specific model path
+            if torch.cuda.is_available():
+                lstm_model.load_state_dict(torch.load(MODEL_SAVE_PATH))
+            else:
+                lstm_model.load_state_dict(torch.load(MODEL_SAVE_PATH, map_location='cpu'))
+            print(f"Model loaded from {MODEL_SAVE_PATH}")
+        else:
+            print(f"Error: Model file not found at {MODEL_SAVE_PATH}. Evaluation will use the last trained model state.")
+
+        # Evaluate on Train set
+        actual_train_all, predicted_train_all, mse_train_per_step, cr_train_per_step = evaluate_on_dataset(
+            dataset_type="Train",
+            model=lstm_model,
+            raw_data_path=TRAIN_DATA_PATH,
+            scaler=data_scaler,
+            window_size=WINDOW_SIZE,
+            prediction_steps=PREDICTION_STEPS,
+            device=DEVICE,
+            batch_size=BATCH_SIZE
+        )
+    else:
+        print("\n--- Skipping evaluation due to training failure ---")
+        print("--- Script Finished with Errors ---")
+        exit(1)
 
     # Evaluate on Test set
     actual_test_all, predicted_test_all, mse_test_per_step, cr_test_per_step = evaluate_on_dataset(
