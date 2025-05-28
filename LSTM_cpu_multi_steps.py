@@ -20,17 +20,17 @@ print(f"Using device: {DEVICE}")
 
 # 2. 定义全局超参数
 PREDICTION_STEPS = 16
-WINDOW_SIZE = 96
-LSTM_HIDDEN_SIZE = 128
-LSTM_NUM_LAYERS = 2
-LSTM_DROPOUT = 0.2
-FC_LAYERS = [64, 32]  # 空列表表示无额外FC层
-BATCH_SIZE = 64
-LEARNING_RATE = 0.001
-MAX_EPOCHS = 50 # 实际运行时可以调大
-EARLY_STOPPING_PATIENCE = 10
+WINDOW_SIZE = 96  # 增加到24小时历史数据 (96 * 15min = 24h)
+LSTM_HIDDEN_SIZE = 256  # 增加隐藏层大小
+LSTM_NUM_LAYERS = 3  # 增加LSTM层数
+LSTM_DROPOUT = 0.3
+FC_LAYERS = [128, 64, 32]  # 增加全连接层
+BATCH_SIZE = 32  # 减小批次大小以适应更大的模型
+LEARNING_RATE = 0.0005  # 降低学习率
+MAX_EPOCHS = 100 # 增加训练轮数
+EARLY_STOPPING_PATIENCE = 15
 EARLY_STOPPING_MIN_DELTA = 0.0001
-NORMALIZATION_METHOD = "minmax"  # "minmax" or "standard"
+NORMALIZATION_METHOD = "standard"  # 改用标准化
 MODEL_SAVE_PATH = "./lstm_wpp_model_cpu.pth" # Changed model save path for CPU version
 FIGURE_SAVE_DIR = "./figures_cpu" # Changed figure save dir for CPU version
 TRAIN_DATA_PATH = "train_set.xlsx"
@@ -70,9 +70,9 @@ def load_and_clean_data(file_path: str) -> pd.Series:
     except FileNotFoundError:
         print(f"Error: File not found at {file_path}")
         return pd.Series(dtype=float)
-    
+
     data_series = pd.to_numeric(data_series, errors='coerce')
-    
+
     if data_series.isnull().any():
         print("Warning: NaNs found after numeric conversion. Applying ffill and bfill.")
         data_series = data_series.ffill()
@@ -111,14 +111,14 @@ class DataScaler:
             self.scaler = MinMaxScaler()
         elif self.method == "standard":
             self.scaler = StandardScaler()
-        
+
         self.scaler.fit(data_np)
         print("Scaler fitted.")
 
     def transform(self, data: Union[pd.Series, np.ndarray]) -> np.ndarray:
         if self.scaler is None:
             raise RuntimeError("Scaler has not been fitted yet. Call fit() first.")
-        
+
         if isinstance(data, pd.Series):
             data_np = data.values.reshape(-1, 1)
         elif isinstance(data, np.ndarray):
@@ -128,7 +128,7 @@ class DataScaler:
                 data_np = data
         else:
             raise TypeError("Input data must be a Pandas Series or NumPy array.")
-            
+
         scaled_data = self.scaler.transform(data_np)
         print(f"Data transformed. Original shape: {data_np.shape}, Scaled shape: {scaled_data.shape}")
         return scaled_data.flatten()
@@ -140,7 +140,7 @@ class DataScaler:
     def inverse_transform(self, data: np.ndarray) -> np.ndarray:
         if self.scaler is None:
             raise RuntimeError("Scaler has not been fitted yet.")
-        
+
         if data.ndim == 1:
             data_np = data.reshape(-1, 1)
         elif data.ndim == 2 and data.shape[1] == 1:
@@ -174,26 +174,117 @@ def create_sequences(data: np.ndarray, window_size: int, prediction_steps: int, 
 
     X_tensor = torch.tensor(X, dtype=torch.float32).to(device)
     y_tensor = torch.tensor(y, dtype=torch.float32).to(device)
-    
+
     print(f"Sequences created. X shape: {X_tensor.shape}, y shape: {y_tensor.shape}")
     return X_tensor, y_tensor
 
-# III. LSTM模型定义 (PyTorch nn.Module)
+# III. 改进的LSTM模型定义 (PyTorch nn.Module)
+class AttentionLayer(nn.Module):
+    """简单的注意力机制层"""
+    def __init__(self, hidden_size):
+        super(AttentionLayer, self).__init__()
+        self.attention = nn.Linear(hidden_size, 1)
+
+    def forward(self, lstm_output):
+        # lstm_output: (batch_size, seq_len, hidden_size)
+        attention_weights = torch.softmax(self.attention(lstm_output), dim=1)
+        # attention_weights: (batch_size, seq_len, 1)
+        context_vector = torch.sum(attention_weights * lstm_output, dim=1)
+        # context_vector: (batch_size, hidden_size)
+        return context_vector, attention_weights
+
+class ImprovedLSTMModel(nn.Module):
+    def __init__(self, input_features: int, hidden_size: int, num_layers: int,
+                 dropout_rate: float, fc_layers_config: list, output_steps: int):
+        super(ImprovedLSTMModel, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.output_steps = output_steps
+
+        # 双向LSTM
+        self.lstm = nn.LSTM(input_size=input_features,
+                            hidden_size=hidden_size,
+                            num_layers=num_layers,
+                            batch_first=True,
+                            dropout=dropout_rate if num_layers > 1 else 0,
+                            bidirectional=True)
+
+        # 注意力机制
+        self.attention = AttentionLayer(hidden_size * 2)  # *2 for bidirectional
+
+        self.dropout = nn.Dropout(dropout_rate)
+
+        # 全连接层
+        fc_module_list = []
+        current_dim = hidden_size * 2  # *2 for bidirectional
+        if fc_layers_config:
+            for fc_hidden_dim in fc_layers_config:
+                fc_module_list.append(nn.Linear(current_dim, fc_hidden_dim))
+                fc_module_list.append(nn.BatchNorm1d(fc_hidden_dim))
+                fc_module_list.append(nn.ReLU())
+                fc_module_list.append(nn.Dropout(dropout_rate))
+                current_dim = fc_hidden_dim
+        self.fc_layers = nn.Sequential(*fc_module_list)
+
+        # 分步预测层 - 为不同预测步长使用不同的输出层
+        self.step_predictors = nn.ModuleList([
+            nn.Linear(current_dim, 1) for _ in range(output_steps)
+        ])
+
+        print("ImprovedLSTMModel initialized.")
+        print(f"  Input features: {input_features}")
+        print(f"  Hidden size: {hidden_size}, Num layers: {num_layers}, Bidirectional: True")
+        print(f"  LSTM Dropout: {dropout_rate if num_layers > 1 else 0}")
+        print(f"  FC Layers Config: {fc_layers_config}")
+        print(f"  Output steps: {output_steps}")
+        print(f"  Using attention mechanism and step-specific predictors")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size = x.size(0)
+
+        # 初始化隐藏状态 (双向LSTM需要 2 * num_layers)
+        h0 = torch.zeros(self.num_layers * 2, batch_size, self.hidden_size, device=x.device)
+        c0 = torch.zeros(self.num_layers * 2, batch_size, self.hidden_size, device=x.device)
+
+        # LSTM前向传播
+        lstm_out, (hn, cn) = self.lstm(x, (h0, c0))
+
+        # 注意力机制
+        context_vector, attention_weights = self.attention(lstm_out)
+
+        # Dropout
+        out = self.dropout(context_vector)
+
+        # 全连接层
+        if hasattr(self, 'fc_layers') and len(self.fc_layers) > 0:
+            out = self.fc_layers(out)
+
+        # 分步预测
+        predictions = []
+        for i, predictor in enumerate(self.step_predictors):
+            step_pred = predictor(out)
+            predictions.append(step_pred)
+
+        # 合并所有预测步
+        output = torch.cat(predictions, dim=1)  # (batch_size, output_steps)
+        return output
+
+# 保持原有模型作为备选
 class LSTMModel(nn.Module):
-    def __init__(self, input_features: int, hidden_size: int, num_layers: int, 
+    def __init__(self, input_features: int, hidden_size: int, num_layers: int,
                  dropout_rate: float, fc_layers_config: list, output_steps: int):
         super(LSTMModel, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
-        
-        self.lstm = nn.LSTM(input_size=input_features, 
+
+        self.lstm = nn.LSTM(input_size=input_features,
                             hidden_size=hidden_size,
-                            num_layers=num_layers, 
+                            num_layers=num_layers,
                             batch_first=True,
                             dropout=dropout_rate if num_layers > 1 else 0)
-        
+
         self.dropout = nn.Dropout(dropout_rate)
-        
+
         fc_module_list = []
         current_dim = hidden_size
         if fc_layers_config:
@@ -202,9 +293,9 @@ class LSTMModel(nn.Module):
                 fc_module_list.append(nn.ReLU())
                 current_dim = fc_hidden_dim
         self.fc_layers = nn.Sequential(*fc_module_list)
-        
+
         self.output_layer = nn.Linear(current_dim, output_steps)
-        
+
         print("LSTMModel initialized.")
         print(f"  Input features: {input_features}")
         print(f"  Hidden size: {hidden_size}, Num layers: {num_layers}, LSTM Dropout: {dropout_rate if num_layers > 1 else 0}")
@@ -214,22 +305,46 @@ class LSTMModel(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size, device=x.device).requires_grad_()
         c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size, device=x.device).requires_grad_()
-        
+
         lstm_out, (hn, cn) = self.lstm(x, (h0, c0))
-        
-        out = lstm_out[:, -1, :] 
+
+        out = lstm_out[:, -1, :]
         out = self.dropout(out)
-        
+
         if hasattr(self, 'fc_layers') and len(self.fc_layers) > 0:
             out = self.fc_layers(out)
-            
+
         out = self.output_layer(out)
         return out
 
+# 改进的损失函数
+class WeightedMSELoss(nn.Module):
+    """为不同预测步长使用不同权重的MSE损失"""
+    def __init__(self, prediction_steps: int, weight_decay: float = 0.9):
+        super(WeightedMSELoss, self).__init__()
+        self.prediction_steps = prediction_steps
+        # 为长期预测分配更高权重以减少滞后
+        self.weights = torch.tensor([weight_decay ** i for i in range(prediction_steps)])
+        # 归一化权重
+        self.weights = self.weights / self.weights.sum()
+        print(f"WeightedMSELoss initialized with weights: {self.weights}")
+
+    def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # predictions: (batch_size, prediction_steps)
+        # targets: (batch_size, prediction_steps)
+        weights = self.weights.to(predictions.device)
+
+        # 计算每个步长的MSE
+        step_losses = torch.mean((predictions - targets) ** 2, dim=0)  # (prediction_steps,)
+
+        # 加权平均
+        weighted_loss = torch.sum(step_losses * weights)
+        return weighted_loss
+
 # IV. 模型训练与验证模块
 # 1. 数据准备
-def prepare_dataloaders(train_file: str, val_split_ratio: float, scaler: DataScaler, 
-                        window_size: int, prediction_steps: int, batch_size: int, 
+def prepare_dataloaders(train_file: str, val_split_ratio: float, scaler: DataScaler,
+                        window_size: int, prediction_steps: int, batch_size: int,
                         device: torch.device):
     print("Preparing dataloaders...")
     raw_data = load_and_clean_data(train_file)
@@ -237,11 +352,11 @@ def prepare_dataloaders(train_file: str, val_split_ratio: float, scaler: DataSca
         raise ValueError(f"No data loaded from {train_file}. Cannot prepare dataloaders.")
 
     scaled_data = scaler.fit_transform(raw_data)
-    
+
     split_index = int(len(scaled_data) * (1 - val_split_ratio))
     train_data_scaled = scaled_data[:split_index]
     val_data_scaled = scaled_data[split_index:]
-    
+
     print(f"Train data scaled shape: {train_data_scaled.shape}")
     print(f"Validation data scaled shape: {val_data_scaled.shape}")
 
@@ -262,23 +377,23 @@ def prepare_dataloaders(train_file: str, val_split_ratio: float, scaler: DataSca
 
     train_dataset = TensorDataset(X_train, y_train)
     val_dataset = TensorDataset(X_val, y_val)
-    
+
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    
+
     print(f"Train DataLoader: {len(train_loader)} batches, Val DataLoader: {len(val_loader)} batches.")
     return train_loader, val_loader
 
 # 2. 训练主函数
-def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader, 
-                criterion: nn.Module, optimizer: optim.Optimizer, 
-                max_epochs: int, early_stopping_patience: int, 
-                early_stopping_min_delta: float, device: torch.device, 
-                model_save_path: str):
+def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader,
+                criterion: nn.Module, optimizer: optim.Optimizer,
+                max_epochs: int, early_stopping_patience: int,
+                early_stopping_min_delta: float, device: torch.device,
+                model_save_path: str, scheduler=None):
     print("Starting model training...")
     train_loss_history = []
     val_loss_history = []
-    
+
     best_val_loss = float('inf')
     epochs_no_improve = 0
     best_model_temp_path = 'best_model_temp_cpu.pth' # Temp path for CPU version
@@ -289,18 +404,18 @@ def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoad
         running_train_loss = 0.0
         for batch_idx, (X_batch, y_batch) in enumerate(train_loader):
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-            
+
             optimizer.zero_grad()
             outputs = model(X_batch)
             loss = criterion(outputs, y_batch)
             loss.backward()
             optimizer.step()
-            
+
             running_train_loss += loss.item()
-        
+
         avg_train_loss = running_train_loss / len(train_loader)
         train_loss_history.append(avg_train_loss)
-        
+
         model.eval()
         running_val_loss = 0.0
         with torch.no_grad():
@@ -309,13 +424,17 @@ def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoad
                 outputs_val = model(X_batch_val)
                 val_loss = criterion(outputs_val, y_batch_val)
                 running_val_loss += val_loss.item()
-        
+
         avg_val_loss = running_val_loss / len(val_loader)
         val_loss_history.append(avg_val_loss)
-        
+
         epoch_duration = time.time() - start_time_epoch
         print(f"Epoch [{epoch+1}/{max_epochs}], Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}, Duration: {epoch_duration:.2f}s")
-        
+
+        # 学习率调度器步进
+        if scheduler is not None:
+            scheduler.step(avg_val_loss)
+
         if avg_val_loss < best_val_loss - early_stopping_min_delta:
             best_val_loss = avg_val_loss
             epochs_no_improve = 0
@@ -324,17 +443,17 @@ def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoad
         else:
             epochs_no_improve += 1
             print(f"No improvement in validation loss for {epochs_no_improve} epoch(s).")
-        
+
         if epochs_no_improve >= early_stopping_patience:
             print(f"Early stopping triggered after {epoch+1} epochs.")
             if os.path.exists(best_model_temp_path):
                 print(f"Loading best model from {best_model_temp_path}")
                 model.load_state_dict(torch.load(best_model_temp_path, map_location=device)) # Ensure map_location for CPU
             break
-            
+
     torch.save(model.state_dict(), model_save_path)
     print(f"Final model saved to {model_save_path}")
-    
+
     if os.path.exists(best_model_temp_path):
         os.remove(best_model_temp_path)
         print(f"Removed temporary best model file: {best_model_temp_path}")
@@ -351,7 +470,7 @@ def make_predictions(model: nn.Module, data_loader: DataLoader, device: torch.de
             X_batch = X_batch.to(device)
             predictions = model(X_batch)
             all_predictions.append(predictions.cpu().numpy())
-    
+
     if not all_predictions:
         return np.array([])
 
@@ -381,7 +500,7 @@ def calculate_cr_accuracy(P_M, P_P): # noqa: N802
         return 0.0 # 或者根据需要返回 np.nan 或其他
 
     N = len(P_M)
-    
+
     # 初始化 R_values 数组
     R_values = np.zeros_like(P_M, dtype=float)
 
@@ -448,7 +567,7 @@ def evaluate_on_dataset(dataset_type: str, model: nn.Module, raw_data_path: str,
 
         actual_values_step_i = scaler.inverse_transform(y_true_scaled_step_i.reshape(-1, 1)).flatten()
         predicted_values_step_i = scaler.inverse_transform(y_pred_scaled_step_i.reshape(-1, 1)).flatten()
-        
+
         actual_values_all_steps[:, i] = actual_values_step_i
         predicted_values_all_steps[:, i] = predicted_values_step_i
 
@@ -460,7 +579,7 @@ def evaluate_on_dataset(dataset_type: str, model: nn.Module, raw_data_path: str,
 
         mse_step_i = mean_squared_error(actual_values_step_i, predicted_values_step_i)
         mse_per_step.append(mse_step_i)
-        
+
         cr_accuracy_step_i = calculate_cr_accuracy(actual_values_step_i, predicted_values_step_i)
         cr_per_step.append(cr_accuracy_step_i)
 
@@ -503,11 +622,11 @@ def plot_predictions_comparison(actual_values: np.ndarray, predicted_values: np.
         return
 
     plt.figure(figsize=(17, 8))
-    
+
     # actual_values and predicted_values are now 1D arrays for a specific step
     plot_actual = actual_values
     plot_predicted = predicted_values
-    
+
     num_points_original = len(actual_values)
 
     if num_points_original > max_points:
@@ -516,7 +635,7 @@ def plot_predictions_comparison(actual_values: np.ndarray, predicted_values: np.
         num_points_to_plot = max_points
     else:
         num_points_to_plot = num_points_original
-        
+
     time_labels = []
     for i in range(num_points_to_plot):
         total_minutes = i * 15 # Assuming 15-minute intervals for x-axis labels
@@ -528,17 +647,17 @@ def plot_predictions_comparison(actual_values: np.ndarray, predicted_values: np.
 
     plt.plot(x_ticks_positions, plot_actual, label="Actual Power", color='blue', marker='.', linestyle='-')
     plt.plot(x_ticks_positions, plot_predicted, label=f"Predicted Power ({prediction_step_label})", color='red', linestyle='--')
-    
+
     plt.title(f"{dataset_name} Set: Actual vs. Predicted Power ({prediction_step_label} Prediction)")
-    
+
     tick_spacing = max(1, num_points_to_plot // 10 if num_points_to_plot > 0 else 1)
-    
+
     actual_ticks_for_plot = [pos for i, pos in enumerate(x_ticks_positions) if i % tick_spacing == 0 and i < len(time_labels)]
     actual_labels_for_plot = [time_labels[i] for i, pos in enumerate(x_ticks_positions) if i % tick_spacing == 0 and i < len(time_labels)]
 
     if actual_ticks_for_plot:
         plt.xticks(ticks=actual_ticks_for_plot, labels=actual_labels_for_plot, rotation=45)
-    
+
     plt.xlabel("Time (HH:MM relative to start of plotted segment)")
     plt.ylabel("Power")
     plt.legend(loc='upper right')
@@ -550,7 +669,7 @@ def plot_predictions_comparison(actual_values: np.ndarray, predicted_values: np.
                  f"LR: {learning_rate}, Actual Epochs: {actual_epochs}")
     plt.figtext(0.01, 0.01, info_text, ha="left", va="bottom", fontsize=8, wrap=True,
                 bbox=dict(boxstyle="round,pad=0.3", fc="wheat", alpha=0.5))
-    
+
     plt.tight_layout(rect=[0, 0.05, 1, 1]) # Adjust rect to make space for figtext
     plt.savefig(save_path)
     plt.show()
@@ -560,7 +679,7 @@ def plot_predictions_comparison(actual_values: np.ndarray, predicted_values: np.
 # VII. 主执行流程
 if __name__ == "__main__":
     print("--- Wind Power Prediction using LSTM (CPU Version) ---")
-    
+
     timestamp_str = datetime.now().strftime("%Y%m%d_%H%M")
 
     if not os.path.exists(TRAIN_DATA_PATH):
@@ -573,7 +692,7 @@ if __name__ == "__main__":
         exit()
 
     data_scaler = DataScaler(method=NORMALIZATION_METHOD)
-    
+
     print("\n--- Preparing DataLoaders ---")
     try:
         train_loader, val_loader = prepare_dataloaders(
@@ -594,7 +713,7 @@ if __name__ == "__main__":
         exit()
 
     print("\n--- Initializing Model ---")
-    lstm_model = LSTMModel(
+    lstm_model = ImprovedLSTMModel(
         input_features=1,
         hidden_size=LSTM_HIDDEN_SIZE,
         num_layers=LSTM_NUM_LAYERS,
@@ -602,10 +721,18 @@ if __name__ == "__main__":
         fc_layers_config=FC_LAYERS,
         output_steps=PREDICTION_STEPS
     ).to(DEVICE)
-    
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(lstm_model.parameters(), lr=LEARNING_RATE)
-    
+
+    # 使用加权损失函数
+    criterion = WeightedMSELoss(prediction_steps=PREDICTION_STEPS, weight_decay=0.85)
+
+    # 使用AdamW优化器，添加权重衰减
+    optimizer = optim.AdamW(lstm_model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+
+    # 添加学习率调度器
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5
+    )
+
     print("\n--- Starting Model Training ---")
     train_loss_hist, val_loss_hist = train_model(
         model=lstm_model,
@@ -617,9 +744,10 @@ if __name__ == "__main__":
         early_stopping_patience=EARLY_STOPPING_PATIENCE,
         early_stopping_min_delta=EARLY_STOPPING_MIN_DELTA,
         device=DEVICE,
-        model_save_path=MODEL_SAVE_PATH # Uses the CPU specific model path
+        model_save_path=MODEL_SAVE_PATH, # Uses the CPU specific model path
+        scheduler=scheduler
     )
-    
+
     actual_epochs_trained = len(train_loss_hist)
     network_params_str = (f"LSTM(H:{LSTM_HIDDEN_SIZE}, L:{LSTM_NUM_LAYERS}, D:{LSTM_DROPOUT if LSTM_NUM_LAYERS > 1 else 0}), "
                           f"FC:{FC_LAYERS if FC_LAYERS else 'None'}")
@@ -628,7 +756,7 @@ if __name__ == "__main__":
     loss_curve_save_path = os.path.join(FIGURE_SAVE_DIR, f"loss_curve_{timestamp_str}.png")
     plot_loss_curves(train_loss_hist, val_loss_hist, loss_curve_save_path,
                        network_params_str, LEARNING_RATE, actual_epochs_trained)
-    
+
     print("\n--- Loading Best Model for Evaluation ---")
     if os.path.exists(MODEL_SAVE_PATH): # Uses CPU specific model path
         lstm_model.load_state_dict(torch.load(MODEL_SAVE_PATH, map_location=DEVICE)) # map_location='cpu' is implicit here
@@ -697,7 +825,7 @@ if __name__ == "__main__":
                 predicted_train_step = predicted_train_all[:, step_index]
                 mse_train_step = mse_train_per_step[step_index]
                 cr_train_step = cr_train_per_step[step_index]
-                
+
                 train_pred_plot_path = os.path.join(
                     FIGURE_SAVE_DIR,
                     f"train_predictions_comparison_{label.replace(' ', '')}_{timestamp_str}.png"
@@ -744,5 +872,5 @@ if __name__ == "__main__":
                 )
             else:
                 print(f"Warning: Step index {step_index} for label '{label}' is out of bounds for PREDICTION_STEPS={PREDICTION_STEPS}. Skipping plot.")
-        
+
     print("\n--- Script Finished ---")
