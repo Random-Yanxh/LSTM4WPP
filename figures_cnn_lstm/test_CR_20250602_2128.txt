@@ -1,0 +1,34 @@
+=== Test Set - C_R Accuracy Report ===
+Generated at: 2025-06-02 21:30:02
+Network: CNN-LSTM(CNN:[32, 64, 128], LSTM_H:256, LSTM_L:2), FC:[128, 64, 32]
+Learning Rate: 0.0005
+Actual Epochs: 19
+Total Prediction Steps: 16
+
+--------------------------------------------------
+Test Set - C_R Accuracy for Each Prediction Step
+--------------------------------------------------
+Lead Time       | C_R (%)
+--------------------------------------------------
+15min           |   79.70
+30min           |   73.67
+45min           |   70.93
+1h              |   66.93
+75min           |   62.89
+90min           |   62.14
+105min          |   60.55
+2h              |   59.42
+135min          |   56.14
+150min          |   56.34
+165min          |   53.06
+3h              |   53.58
+195min          |   49.52
+210min          |   49.45
+225min          |   47.47
+4h              |   46.08
+--------------------------------------------------
+
+Statistics:
+Average C_R: 59.24%
+Best C_R: 79.70% (at 15min)
+Worst C_R: 46.08% (at 240min)

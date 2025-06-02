@@ -1,0 +1,34 @@
+=== Test Set - C_R Accuracy Report ===
+Generated at: 2025-06-02 20:44:19
+Network: GRU(H:256, L:3, D:0.3), FC:[128, 32]
+Learning Rate: 0.0005
+Actual Epochs: 27
+Total Prediction Steps: 16
+
+--------------------------------------------------
+Test Set - C_R Accuracy for Each Prediction Step
+--------------------------------------------------
+Lead Time       | C_R (%)
+--------------------------------------------------
+15min           |   82.94
+30min           |   76.40
+45min           |   71.49
+1h              |   67.40
+75min           |   64.14
+90min           |   61.90
+105min          |   59.42
+2h              |   57.97
+135min          |   56.30
+150min          |   53.79
+165min          |   52.25
+3h              |   49.65
+195min          |   47.68
+210min          |   46.48
+225min          |   44.24
+4h              |   42.44
+--------------------------------------------------
+
+Statistics:
+Average C_R: 58.41%
+Best C_R: 82.94% (at 15min)
+Worst C_R: 42.44% (at 240min)

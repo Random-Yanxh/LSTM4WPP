@@ -18,17 +18,17 @@ from datetime import datetime
 DEVICE = torch.device("cpu") # Force CPU
 print(f"Using device: {DEVICE}")
 
-# 2. 定义全局超参数
+# 2. 定义全局超参数 - CPU优化版本（速度优先）
 PREDICTION_STEPS = 16
-WINDOW_SIZE = 96  # 增加到24小时历史数据 (96 * 15min = 24h)
-LSTM_HIDDEN_SIZE = 256  # 增加隐藏层大小
-LSTM_NUM_LAYERS = 3  # 增加LSTM层数
-LSTM_DROPOUT = 0.3
-FC_LAYERS = [128, 64, 32]  # 增加全连接层
-BATCH_SIZE = 32  # 减小批次大小以适应更大的模型
-LEARNING_RATE = 0.0005  # 降低学习率
-MAX_EPOCHS = 100 # 增加训练轮数
-EARLY_STOPPING_PATIENCE = 15
+WINDOW_SIZE = 64  # 减少历史数据窗口 (64 * 15min = 16h) - 从24h减少到16h
+LSTM_HIDDEN_SIZE = 128  # 减少隐藏层大小 (原256) - 减少50%参数
+LSTM_NUM_LAYERS = 2  # 减少LSTM层数 (原3) - 减少计算复杂度
+LSTM_DROPOUT = 0.2  # 减少dropout以提高训练速度
+FC_LAYERS = [64, 32]  # 简化全连接层 (原[128, 64, 32]) - 减少参数
+BATCH_SIZE = 64  # 增加批次大小以提高CPU利用率 (原32)
+LEARNING_RATE = 0.001  # 提高学习率以加快收敛 (原0.0005)
+MAX_EPOCHS = 100 # 
+EARLY_STOPPING_PATIENCE = 10  
 EARLY_STOPPING_MIN_DELTA = 0.0001
 NORMALIZATION_METHOD = "standard"  # 改用标准化
 MODEL_SAVE_PATH = "./lstm_wpp_model_cpu.pth" # Changed model save path for CPU version
@@ -201,26 +201,26 @@ class ImprovedLSTMModel(nn.Module):
         self.num_layers = num_layers
         self.output_steps = output_steps
 
-        # 双向LSTM
+        # 单向LSTM (CPU优化：减少计算量)
         self.lstm = nn.LSTM(input_size=input_features,
                             hidden_size=hidden_size,
                             num_layers=num_layers,
                             batch_first=True,
                             dropout=dropout_rate if num_layers > 1 else 0,
-                            bidirectional=True)
+                            bidirectional=False)  # 改为单向以提高速度
 
         # 注意力机制
-        self.attention = AttentionLayer(hidden_size * 2)  # *2 for bidirectional
+        self.attention = AttentionLayer(hidden_size)  # 单向LSTM
 
         self.dropout = nn.Dropout(dropout_rate)
 
         # 全连接层
         fc_module_list = []
-        current_dim = hidden_size * 2  # *2 for bidirectional
+        current_dim = hidden_size  # 单向LSTM
         if fc_layers_config:
             for fc_hidden_dim in fc_layers_config:
                 fc_module_list.append(nn.Linear(current_dim, fc_hidden_dim))
-                fc_module_list.append(nn.BatchNorm1d(fc_hidden_dim))
+                # 移除BatchNorm以减少CPU计算开销
                 fc_module_list.append(nn.ReLU())
                 fc_module_list.append(nn.Dropout(dropout_rate))
                 current_dim = fc_hidden_dim
@@ -231,26 +231,27 @@ class ImprovedLSTMModel(nn.Module):
             nn.Linear(current_dim, 1) for _ in range(output_steps)
         ])
 
-        print("ImprovedLSTMModel initialized.")
+        print("ImprovedLSTMModel initialized (CPU Optimized).")
         print(f"  Input features: {input_features}")
-        print(f"  Hidden size: {hidden_size}, Num layers: {num_layers}, Bidirectional: True")
+        print(f"  Hidden size: {hidden_size}, Num layers: {num_layers}, Bidirectional: False")
         print(f"  LSTM Dropout: {dropout_rate if num_layers > 1 else 0}")
         print(f"  FC Layers Config: {fc_layers_config}")
         print(f"  Output steps: {output_steps}")
         print(f"  Using attention mechanism and step-specific predictors")
+        print(f"  CPU Optimizations: Reduced parameters, Single-direction LSTM")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size = x.size(0)
 
-        # 初始化隐藏状态 (双向LSTM需要 2 * num_layers)
-        h0 = torch.zeros(self.num_layers * 2, batch_size, self.hidden_size, device=x.device)
-        c0 = torch.zeros(self.num_layers * 2, batch_size, self.hidden_size, device=x.device)
+        # 初始化隐藏状态 (单向LSTM)
+        h0 = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=x.device)
+        c0 = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=x.device)
 
         # LSTM前向传播
-        lstm_out, (hn, cn) = self.lstm(x, (h0, c0))
+        lstm_out, _ = self.lstm(x, (h0, c0))
 
         # 注意力机制
-        context_vector, attention_weights = self.attention(lstm_out)
+        context_vector, _ = self.attention(lstm_out)
 
         # Dropout
         out = self.dropout(context_vector)
@@ -306,7 +307,7 @@ class LSTMModel(nn.Module):
         h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size, device=x.device).requires_grad_()
         c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size, device=x.device).requires_grad_()
 
-        lstm_out, (hn, cn) = self.lstm(x, (h0, c0))
+        lstm_out, _ = self.lstm(x, (h0, c0))
 
         out = lstm_out[:, -1, :]
         out = self.dropout(out)
@@ -615,50 +616,32 @@ def plot_loss_curves(train_loss_history: list, val_loss_history: list, save_path
 # 2. 预测对比图绘制函数
 def plot_predictions_comparison(actual_values: np.ndarray, predicted_values: np.ndarray,
                                   dataset_name: str, prediction_step_label: str, save_path: str,
-                                  mse_value: float, cr_value: float, network_params_str: str, learning_rate: float, actual_epochs: int,
-                                  max_points: int = 500):
+                                  mse_value: float, cr_value: float, network_params_str: str, learning_rate: float, actual_epochs: int):
     if actual_values.size == 0 or predicted_values.size == 0:
         print(f"No data to plot for {dataset_name} ({prediction_step_label}) predictions. Skipping plot.")
         return
 
     plt.figure(figsize=(17, 8))
 
-    # actual_values and predicted_values are now 1D arrays for a specific step
+    # 绘制所有数据点，不进行截取
     plot_actual = actual_values
     plot_predicted = predicted_values
+    num_points_to_plot = len(actual_values)
 
-    num_points_original = len(actual_values)
+    # 使用从1开始的等差数列作为横轴
+    x_axis = np.arange(1, num_points_to_plot + 1)
 
-    if num_points_original > max_points:
-        plot_actual = actual_values[-max_points:]
-        plot_predicted = predicted_values[-max_points:]
-        num_points_to_plot = max_points
-    else:
-        num_points_to_plot = num_points_original
-
-    time_labels = []
-    for i in range(num_points_to_plot):
-        total_minutes = i * 15 # Assuming 15-minute intervals for x-axis labels
-        hours = (total_minutes // 60) % 24
-        minutes = total_minutes % 60
-        time_labels.append(f"{hours:02d}:{minutes:02d}")
-
-    x_ticks_positions = range(num_points_to_plot)
-
-    plt.plot(x_ticks_positions, plot_actual, label="Actual Power", color='blue', marker='.', linestyle='-')
-    plt.plot(x_ticks_positions, plot_predicted, label=f"Predicted Power ({prediction_step_label})", color='red', linestyle='--')
+    plt.plot(x_axis, plot_actual, label="Actual Power", color='blue', marker='.', linestyle='-')
+    plt.plot(x_axis, plot_predicted, label=f"Predicted Power ({prediction_step_label})", color='red', linestyle='--')
 
     plt.title(f"{dataset_name} Set: Actual vs. Predicted Power ({prediction_step_label} Prediction)")
 
+    # 设置横轴标签，显示合理数量的刻度
     tick_spacing = max(1, num_points_to_plot // 10 if num_points_to_plot > 0 else 1)
+    x_ticks = x_axis[::tick_spacing]
+    plt.xticks(x_ticks)
 
-    actual_ticks_for_plot = [pos for i, pos in enumerate(x_ticks_positions) if i % tick_spacing == 0 and i < len(time_labels)]
-    actual_labels_for_plot = [time_labels[i] for i, pos in enumerate(x_ticks_positions) if i % tick_spacing == 0 and i < len(time_labels)]
-
-    if actual_ticks_for_plot:
-        plt.xticks(ticks=actual_ticks_for_plot, labels=actual_labels_for_plot, rotation=45)
-
-    plt.xlabel("Time (HH:MM relative to start of plotted segment)")
+    plt.xlabel("Data Point Index")
     plt.ylabel("Power")
     plt.legend(loc='upper right')
     plt.grid(True)
@@ -666,19 +649,66 @@ def plot_predictions_comparison(actual_values: np.ndarray, predicted_values: np.
     info_text = (f"{dataset_name} ({prediction_step_label}) MSE: {mse_value:.4f}\n"
                  f"{dataset_name} ({prediction_step_label}) C_R: {cr_value:.2f}%\n"
                  f"Network: {network_params_str}\n"
-                 f"LR: {learning_rate}, Actual Epochs: {actual_epochs}")
+                 f"LR: {learning_rate}, Actual Epochs: {actual_epochs}\n"
+                 f"Total Points: {num_points_to_plot}")
     plt.figtext(0.01, 0.01, info_text, ha="left", va="bottom", fontsize=8, wrap=True,
                 bbox=dict(boxstyle="round,pad=0.3", fc="wheat", alpha=0.5))
 
-    plt.tight_layout(rect=[0, 0.05, 1, 1]) # Adjust rect to make space for figtext
+    plt.tight_layout(rect=[0, 0.05, 1, 1])
     plt.savefig(save_path)
     plt.show()
     plt.close()
     print(f"Predictions comparison plot for {dataset_name} ({prediction_step_label}) saved to {save_path}")
 
+# 3. C_R准确率表格保存函数
+def save_cr_accuracy_table(cr_per_step: list, save_path: str, dataset_name: str,
+                          network_params_str: str, learning_rate: float, actual_epochs: int):
+    """保存C_R准确率表格到文件"""
+    if not cr_per_step or any(np.isnan(cr_per_step)):
+        print(f"C_R values for {dataset_name.lower()} set are not available or contain NaNs, skipping file save.")
+        return
+
+    try:
+        with open(save_path, 'w', encoding='utf-8') as f:
+            # 写入文件头信息
+            f.write(f"=== {dataset_name} Set - C_R Accuracy Report ===\n")
+            f.write(f"Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Network: {network_params_str}\n")
+            f.write(f"Learning Rate: {learning_rate}\n")
+            f.write(f"Actual Epochs: {actual_epochs}\n")
+            f.write(f"Total Prediction Steps: {len(cr_per_step)}\n\n")
+
+            # 写入表格
+            f.write("--------------------------------------------------\n")
+            f.write(f"{dataset_name} Set - C_R Accuracy for Each Prediction Step\n")
+            f.write("--------------------------------------------------\n")
+            f.write(f"{'Lead Time':<15} | {'C_R (%)':>7}\n")
+            f.write("--------------------------------------------------\n")
+
+            for i, cr_value in enumerate(cr_per_step):
+                lead_time_minutes = (i + 1) * 15
+                if lead_time_minutes % 60 == 0:
+                    lead_time_str = f"{lead_time_minutes // 60}h"
+                else:
+                    lead_time_str = f"{lead_time_minutes}min"
+                f.write(f"{lead_time_str:<15} | {cr_value:>7.2f}\n")
+
+            f.write("--------------------------------------------------\n")
+
+            # 写入统计信息
+            f.write(f"\nStatistics:\n")
+            f.write(f"Average C_R: {np.mean(cr_per_step):.2f}%\n")
+            f.write(f"Best C_R: {np.max(cr_per_step):.2f}% (at {((np.argmax(cr_per_step) + 1) * 15)}min)\n")
+            f.write(f"Worst C_R: {np.min(cr_per_step):.2f}% (at {((np.argmin(cr_per_step) + 1) * 15)}min)\n")
+
+        print(f"C_R accuracy table saved to {save_path}")
+
+    except Exception as e:
+        print(f"Error saving C_R accuracy table: {e}")
+
 # VII. 主执行流程
 if __name__ == "__main__":
-    print("--- Wind Power Prediction using LSTM (CPU Version) ---")
+    print("--- Wind Power Prediction using LSTM (CPU Optimized - Speed Priority) ---")
 
     timestamp_str = datetime.now().strftime("%Y%m%d_%H%M")
 
@@ -722,8 +752,8 @@ if __name__ == "__main__":
         output_steps=PREDICTION_STEPS
     ).to(DEVICE)
 
-    # 使用加权损失函数
-    criterion = WeightedMSELoss(prediction_steps=PREDICTION_STEPS, weight_decay=0.85)
+    # 使用简单MSE损失函数 (CPU优化：减少计算复杂度)
+    criterion = nn.MSELoss()
 
     # 使用AdamW优化器，添加权重衰减
     optimizer = optim.AdamW(lstm_model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
@@ -749,7 +779,7 @@ if __name__ == "__main__":
     )
 
     actual_epochs_trained = len(train_loss_hist)
-    network_params_str = (f"LSTM(H:{LSTM_HIDDEN_SIZE}, L:{LSTM_NUM_LAYERS}, D:{LSTM_DROPOUT if LSTM_NUM_LAYERS > 1 else 0}), "
+    network_params_str = (f"LSTM-CPU-Opt(H:{LSTM_HIDDEN_SIZE}, L:{LSTM_NUM_LAYERS}, D:{LSTM_DROPOUT if LSTM_NUM_LAYERS > 1 else 0}, Uni-dir), "
                           f"FC:{FC_LAYERS if FC_LAYERS else 'None'}")
 
     print("\n--- Visualizing Training ---")
@@ -803,6 +833,17 @@ if __name__ == "__main__":
                 lead_time_str = f"{lead_time_minutes}min"
             print(f"{lead_time_str:<15} | {cr_value:>7.2f}")
         print("--------------------------------------------------")
+
+        # 保存C_R准确率表格到文件
+        cr_table_save_path = os.path.join(FIGURE_SAVE_DIR, f"test_CR_{timestamp_str}.txt")
+        save_cr_accuracy_table(
+            cr_per_step=cr_test_per_step,
+            save_path=cr_table_save_path,
+            dataset_name="Test",
+            network_params_str=network_params_str,
+            learning_rate=LEARNING_RATE,
+            actual_epochs=actual_epochs_trained
+        )
     else:
         print("\nC_R values for test set are not available or contain NaNs, skipping C_R table.")
 

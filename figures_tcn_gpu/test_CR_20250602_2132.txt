@@ -1,0 +1,34 @@
+=== Test Set - C_R Accuracy Report ===
+Generated at: 2025-06-02 21:46:32
+Network: TCN(Channels:[32, 64, 128], Kernel:3, Dropout:0.2), FC:[64, 32]
+Learning Rate: 0.001
+Actual Epochs: 21
+Total Prediction Steps: 16
+
+--------------------------------------------------
+Test Set - C_R Accuracy for Each Prediction Step
+--------------------------------------------------
+Lead Time       | C_R (%)
+--------------------------------------------------
+15min           |   83.75
+30min           |   76.08
+45min           |   71.13
+1h              |   67.49
+75min           |   63.93
+90min           |   61.54
+105min          |   58.20
+2h              |   56.18
+135min          |   54.42
+150min          |   52.42
+165min          |   50.65
+3h              |   48.21
+195min          |   45.85
+210min          |   44.01
+225min          |   42.08
+4h              |   40.57
+--------------------------------------------------
+
+Statistics:
+Average C_R: 57.28%
+Best C_R: 83.75% (at 15min)
+Worst C_R: 40.57% (at 240min)
